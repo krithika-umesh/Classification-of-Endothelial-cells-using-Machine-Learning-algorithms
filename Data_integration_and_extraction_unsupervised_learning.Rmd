@@ -1,0 +1,124 @@
+---
+title: "Final_project_AML"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(Matrix)
+library(patchwork)
+library(kBET)
+library(cluster, quietly = TRUE)
+library(lisi)
+library(sctransform)
+library(glmGamPoi)
+
+```
+
+```{r, read individual data objects, echo=TRUE, cache=TRUE}
+##Lymph node datasets
+ln_tu_hev <- readRDS("C:/Users/krith/Documents/Lab/Objects/LN_TU_HEV.rds")
+#subset control lymph endothelial cells
+lnhev <- subset(ln_tu_hev, subset= orig.ident == "LN_HEV")
+
+bv_obj <- readRDS("C:/Users/krith/Documents/Lab/Objects/bv_obj.rds")
+#subset control lymph endothelial cells
+hec <- subset(bv_obj, subset=orig.ident == "HEC")
+
+#Brain endothelial dataset
+brain_ec <- readRDS("C:/Users/krith/Documents/Lab/Objects/Merge/brain_ec.rds")
+```
+
+
+```{r, merge datasets, echo=TRUE, cache=TRUE}
+merge_ec <- merge(x=lnhev, y=c(hec,brain_ec), add.cell.ids = c('LNHEV','HEC','BrainEC'),project="Combined_EC")
+merge_ec$batch <- NULL
+merge_ec[["percent.mt"]] <- PercentageFeatureSet(merge_ec, pattern = "^mt[-\\.]")
+VlnPlot(merge_ec, features = c("nFeature_RNA", "nCount_RNA","percent.mt"), ncol=3)
+plot1 <- FeatureScatter(merge_ec, feature1 = 'nCount_RNA', feature2 = 'percent.mt')
+plot2 <- FeatureScatter(merge_ec, feature1 = 'nCount_RNA', feature2 = 'nFeature_RNA')
+plot1+plot2
+
+```
+
+
+
+```{r, Data Integration with SCTransform, cache=TRUE, echo=TRUE}
+##Split the seurat object into batches by original identity
+#Normalize and scale data using SCTransform
+batch_list <- SplitObject(merge_ec, split.by = 'orig.ident')
+batch_list
+for (i in 1:length(batch_list)) {
+    batch_list[[i]] <- SCTransform(batch_list[[i]], method = "glmGamPoi",vars.to.regress = "percent.mt", verbose = FALSE)
+}
+ec_features <- SelectIntegrationFeatures(object.list = batch_list, nfeatures=5000)
+batch_list <- PrepSCTIntegration(object.list = batch_list, anchor.features = ec_features, 
+    verbose = FALSE)
+ec_anchors <- FindIntegrationAnchors(object.list = batch_list, normalization.method = "SCT", 
+    anchor.features = ec_features, verbose = FALSE)
+ec_integrated <- IntegrateData(anchorset = ec_anchors, normalization.method = "SCT", 
+    verbose = FALSE)
+
+############################################################
+##The integrated data was extracted using the code below, transposed to have rows of cells and columns of genes and written to a file for further analysis in python.
+
+#sc <- GetAssayData(ec_integrated, slot = 'scale.data', assay='SCT')
+#sc <- t(sc)
+
+############################################################
+
+
+##Group cell types
+brain <- c("Arterial", "Venous","Capillary")
+lymph_node <- c("LN_HEV", "HEC")
+
+##Create metadata feature of groups
+ec_integrated@meta.data$groups[ec_integrated@meta.data$orig.ident %in% brain] <- "BrainEC"
+ec_integrated@meta.data$groups[ec_integrated@meta.data$orig.ident %in% lymph_node] <- "Lymph_nodeEC"
+
+```
+
+
+```{r, PCA,UMAP}
+##Dimensionality reduction using PCA & UMAP
+ec_integrated <- RunPCA(ec_integrated, verbose = FALSE)
+ElbowPlot(ec_integrated, ndims=ncol(Embeddings(ec_integrated, "pca")))
+ec_integrated <- RunUMAP(ec_integrated, dims = 1:30)
+ec_integrated <- FindNeighbors(ec_integrated, reduction = "pca", dims = 1:50)
+ec_integrated <- FindClusters(ec_integrated, resolution = 0.2)
+
+```
+
+
+```{r, Plots}
+p1 <- DimPlot(ec_integrated, reduction = "umap", group.by = "orig.ident")
+p2 <- DimPlot(ec_integrated, reduction = "umap", group.by = "groups", label = TRUE, repel = TRUE)
+p3 <- DimPlot(ec_integrated, reduction = "umap", group.by = "seurat_clusters", label = TRUE, repel = TRUE)
+p1+p2
+p2+p3
+
+```
+
+```{r, evaluation}
+##Evaluation of integration using kBET
+data <- GetAssayData(ec_integrated, slot = "scale.data")
+data <- t(data)
+data <- as.matrix(data)
+batch <- ec_integrated$orig.ident
+batch.estimate <- kBET(data, batch, plot=TRUE, do.pca=TRUE, dim.pca=10)
+
+##Silhouette score
+dist.matrix <- dist(x = Embeddings(object = ec_integrated[['pca']])[,1:30])
+clusters <- ec_integrated$orig.ident
+sil <- silhouette(x = as.numeric(x = as.factor(x = clusters)), dist = dist.matrix)
+ec_integrated$sil <- sil[, 3]
+print("The average silhouette score is:")
+summary(ec_integrated$sil)
+```
+
